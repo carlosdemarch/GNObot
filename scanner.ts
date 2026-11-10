@@ -10,6 +10,7 @@ import {
   type Address,
 } from 'viem';
 import { gnosis } from 'viem/chains';
+import { createExecutor, type Opportunity, type Venue } from './executor.js';
 
 // ============================================================================
 // 1. ENVIRONMENT & CONFIGURATION LOADER
@@ -33,6 +34,11 @@ function loadConfig() {
     wssUrl,
     executeTrades: process.env.EXECUTE_TRADES === 'true',
     enableMainnetTrading: process.env.ENABLE_MAINNET_TRADING === 'true',
+    allowUnprofitableSmokeTest: process.env.ALLOW_UNPROFITABLE_SMOKE_TEST === 'true',
+    maxTradesPerRun: Number(process.env.MAX_TRADES_PER_RUN || 2),
+    maxTotalWxdaiPerRun: parseUnits(process.env.MAX_TOTAL_WXDAI_PER_RUN || '200', 18),
+    maxGasPriceWei: parseUnits(process.env.MAX_GAS_PRICE_GWEI || '10', 9),
+    maxSlippageBps: BigInt(process.env.MAX_SLIPPAGE_BPS || 50),
     tradeSizesWxdai,
     gasCostWei: parseUnits(process.env.GAS_COST_XDAI || '0.001', 18),
     minNetProfitWei: parseUnits(process.env.MIN_NET_PROFIT_WXDAI || '0.01', 18),
@@ -48,14 +54,6 @@ function loadConfig() {
 }
 
 const CONFIG = loadConfig();
-
-// Enforce read-only safety guard
-if (CONFIG.executeTrades || CONFIG.enableMainnetTrading) {
-  console.warn(
-    '[WARN] EXECUTE_TRADES / ENABLE_MAINNET_TRADING is true in .env, ' +
-      'but this script is strictly a READ-ONLY scanner. No transactions will be signed.'
-  );
-}
 
 // ============================================================================
 // 2. DEX POOL & QUOTER ADDRESSES (GNOSIS MAINNET)
@@ -110,6 +108,20 @@ const publicClient = createPublicClient({
     webSocket(CONFIG.wssUrl, { reconnect: true }),
     http(CONFIG.rpcUrl),
   ]),
+});
+
+const executor = createExecutor(publicClient, {
+  rpcUrl: CONFIG.rpcUrl,
+  wxdai: CONFIG.wxdai,
+  gno: CONFIG.gno,
+  executeTrades: CONFIG.executeTrades,
+  enableMainnetTrading: CONFIG.enableMainnetTrading,
+  allowUnprofitableSmokeTest: CONFIG.allowUnprofitableSmokeTest,
+  maxTradesPerRun: CONFIG.maxTradesPerRun,
+  maxTotalWxdaiPerRun: CONFIG.maxTotalWxdaiPerRun,
+  maxGasPriceWei: CONFIG.maxGasPriceWei,
+  maxSlippageBps: CONFIG.maxSlippageBps,
+  minNetProfitWei: CONFIG.minNetProfitWei,
 });
 
 let isScanning = false;
@@ -237,6 +249,7 @@ async function scanBlock(blockNumber: bigint, blockTimestampSec?: bigint) {
     );
 
     // --- STEP 3: Evaluate All 6 Directional Routes Across All 4 Sizes ---
+    let bestOpp: Opportunity | undefined;
     for (let i = 0; i < numSizes; i++) {
       const size = CONFIG.tradeSizesWxdai[i];
       const inWei = size.amountWei;
@@ -252,9 +265,17 @@ async function scanBlock(blockNumber: bigint, blockTimestampSec?: bigint) {
       const uniV3OutFromSushiGno =
         sushiQuote?.status === 'success' ? (sushiQuote.result as readonly bigint[])[0] : 0n;
 
+      const gnoByVenue: Record<Venue, bigint> = {
+        honeyswap: gnoFromHoney,
+        sushiswap: gnoFromSushi,
+        uniswapv3: gnoFromUniV3,
+      };
+
       const candidates = [
         {
           route: 'Honeyswap -> SushiSwap',
+          buy: 'honeyswap' as Venue,
+          sell: 'sushiswap' as Venue,
           outWei: getV2AmountOut(
             gnoFromHoney,
             sushiReserves.gnoReserve,
@@ -263,6 +284,8 @@ async function scanBlock(blockNumber: bigint, blockTimestampSec?: bigint) {
         },
         {
           route: 'SushiSwap -> Honeyswap',
+          buy: 'sushiswap' as Venue,
+          sell: 'honeyswap' as Venue,
           outWei: getV2AmountOut(
             gnoFromSushi,
             honeyReserves.gnoReserve,
@@ -271,14 +294,20 @@ async function scanBlock(blockNumber: bigint, blockTimestampSec?: bigint) {
         },
         {
           route: 'Honeyswap -> UniswapV3',
+          buy: 'honeyswap' as Venue,
+          sell: 'uniswapv3' as Venue,
           outWei: uniV3OutFromHoneyGno,
         },
         {
           route: 'SushiSwap -> UniswapV3',
+          buy: 'sushiswap' as Venue,
+          sell: 'uniswapv3' as Venue,
           outWei: uniV3OutFromSushiGno,
         },
         {
           route: 'UniswapV3 -> Honeyswap',
+          buy: 'uniswapv3' as Venue,
+          sell: 'honeyswap' as Venue,
           outWei: getV2AmountOut(
             gnoFromUniV3,
             honeyReserves.gnoReserve,
@@ -287,6 +316,8 @@ async function scanBlock(blockNumber: bigint, blockTimestampSec?: bigint) {
         },
         {
           route: 'UniswapV3 -> SushiSwap',
+          buy: 'uniswapv3' as Venue,
+          sell: 'sushiswap' as Venue,
           outWei: getV2AmountOut(
             gnoFromUniV3,
             sushiReserves.gnoReserve,
@@ -305,6 +336,18 @@ async function scanBlock(blockNumber: bigint, blockTimestampSec?: bigint) {
       const spreadBps = Number((grossProfitWei * 10000n) / inWei);
       const isProfitable = netProfitWei >= CONFIG.minNetProfitWei;
 
+      if (isProfitable || CONFIG.allowUnprofitableSmokeTest) {
+        const opp: Opportunity = {
+          buyVenue: best.buy,
+          sellVenue: best.sell,
+          amountInWei: inWei,
+          expectedGnoWei: gnoByVenue[best.buy],
+          expectedOutWei: best.outWei,
+          netProfitWei,
+        };
+        if (!bestOpp || opp.netProfitWei > bestOpp.netProfitWei) bestOpp = opp;
+      }
+
       const statusTag = isProfitable ? '✅ PROFITABLE' : '❌ NO ARB';
       console.log(
         `  [${size.label.padStart(3, ' ')} wxDAI] Best: ${best.route.padEnd(22, ' ')} | ` +
@@ -313,6 +356,9 @@ async function scanBlock(blockNumber: bigint, blockTimestampSec?: bigint) {
           `Net: ${Number(formatUnits(netProfitWei, 18)).toFixed(4)} wxDAI | ${statusTag}`
       );
     }
+
+    // Execute at most one trade per block: the most profitable size/route
+    if (bestOpp) await executor.execute(bestOpp);
   } catch (err) {
     console.error(`[Block ${blockNumber}] Scanner error:`, err);
   } finally {
@@ -324,7 +370,8 @@ async function scanBlock(blockNumber: bigint, blockTimestampSec?: bigint) {
 // 5. ENTRYPOINT & LIFECYCLE MANAGEMENT
 // ============================================================================
 async function main() {
-  console.log('Starting Gnosis Chain GNO/wxDAI Read-Only Arbitrage Scanner...');
+  console.log('Starting Gnosis Chain GNO/wxDAI Arbitrage Bot...');
+  console.log(`Execution mode: ${executor.mode}${executor.address ? ` | Wallet: ${executor.address}` : ''}`);
   console.log(
     `Trigger Mode: ${CONFIG.scanTriggerMode} | Sizes: ${CONFIG.tradeSizesWxdai.map((s) => s.label).join(', ')} wxDAI | ` +
       `Gas Est: ${formatUnits(CONFIG.gasCostWei, 18)} xDAI | Min Net Profit: ${formatUnits(CONFIG.minNetProfitWei, 18)} wxDAI`
