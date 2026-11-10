@@ -63,12 +63,6 @@ export function createExecutor(publicClient: PublicClient, cfg: ExecutorConfig) 
     ? privateKeyToAccount((pk!.startsWith('0x') ? pk! : `0x${pk}`) as Hex)
     : undefined;
 
-  if (account && process.env.WALLET_ADDRESS) {
-    if (process.env.WALLET_ADDRESS.toLowerCase() !== account.address.toLowerCase()) {
-      throw new Error('WALLET_ADDRESS does not match the address derived from PRIVATE_KEY');
-    }
-  }
-
   const wallet = account
     ? createWalletClient({ account, chain: gnosis, transport: http(cfg.rpcUrl) })
     : undefined;
