@@ -38,7 +38,6 @@ function loadConfig() {
     maxTradesPerRun: Number(process.env.MAX_TRADES_PER_RUN || 2),
     maxTotalWxdaiPerRun: parseUnits(process.env.MAX_TOTAL_WXDAI_PER_RUN || '200', 18),
     maxGasPriceWei: parseUnits(process.env.MAX_GAS_PRICE_GWEI || '2', 9),
-    maxSlippageBps: BigInt(process.env.MAX_SLIPPAGE_BPS || 50),
     tradeSizesWxdai,
     gasCostWei: parseUnits(process.env.GAS_COST_XDAI || '0.0001', 18),
     minNetProfitWei: parseUnits(process.env.MIN_NET_PROFIT_WXDAI || '0.01', 18),
@@ -120,14 +119,15 @@ const executor = createExecutor(publicClient, {
   maxTradesPerRun: CONFIG.maxTradesPerRun,
   maxTotalWxdaiPerRun: CONFIG.maxTotalWxdaiPerRun,
   maxGasPriceWei: CONFIG.maxGasPriceWei,
-  maxSlippageBps: CONFIG.maxSlippageBps,
   minNetProfitWei: CONFIG.minNetProfitWei,
 });
 
 let isScanning = false;
+let stopping = false;
+let stopTrigger = () => {};
 
 async function scanBlock(blockNumber: bigint, blockTimestampSec?: bigint) {
-  if (isScanning) return; // Prevent overlapping scans if RPC lags
+  if (isScanning || stopping) return;
   isScanning = true;
   const startMs = Date.now();
 
@@ -336,14 +336,17 @@ async function scanBlock(blockNumber: bigint, blockTimestampSec?: bigint) {
       const spreadBps = Number((grossProfitWei * 10000n) / inWei);
       const isProfitable = netProfitWei >= CONFIG.minNetProfitWei;
 
-      if (isProfitable || CONFIG.allowUnprofitableSmokeTest) {
+      const executable = candidates
+        .filter((c) => c.buy !== 'uniswapv3' && c.sell !== 'uniswapv3')
+        .sort((a, b) => b.outWei > a.outWei ? 1 : -1)[0];
+      if (executable && executable.outWei - inWei - CONFIG.gasCostWei >= CONFIG.minNetProfitWei) {
         const opp: Opportunity = {
-          buyVenue: best.buy,
-          sellVenue: best.sell,
+          buyVenue: executable.buy,
+          sellVenue: executable.sell,
           amountInWei: inWei,
-          expectedGnoWei: gnoByVenue[best.buy],
-          expectedOutWei: best.outWei,
-          netProfitWei,
+          expectedGnoWei: gnoByVenue[executable.buy],
+          expectedOutWei: executable.outWei,
+          netProfitWei: executable.outWei - inWei - CONFIG.gasCostWei,
         };
         if (!bestOpp || opp.netProfitWei > bestOpp.netProfitWei) bestOpp = opp;
       }
@@ -363,6 +366,7 @@ async function scanBlock(blockNumber: bigint, blockTimestampSec?: bigint) {
     console.error(`[Block ${blockNumber}] Scanner error:`, err);
   } finally {
     isScanning = false;
+    if (stopping) process.exit(0);
   }
 }
 
@@ -377,15 +381,16 @@ async function main() {
       `Gas Est: ${formatUnits(CONFIG.gasCostWei, 18)} xDAI | Min Net Profit: ${formatUnits(CONFIG.minNetProfitWei, 18)} wxDAI`
   );
 
-  // Enforce MAX_RUNTIME_MINUTES shutdown timer
   const maxRuntimeMs = CONFIG.maxRuntimeMinutes * 60 * 1000;
   setTimeout(() => {
-    console.log(`\nReached MAX_RUNTIME_MINUTES (${CONFIG.maxRuntimeMinutes} min). Exiting cleanly.`);
-    process.exit(0);
+    console.log(`\nReached MAX_RUNTIME_MINUTES (${CONFIG.maxRuntimeMinutes} min). Stopping after any active scan or transaction.`);
+    stopping = true;
+    stopTrigger();
+    if (!isScanning) process.exit(0);
   }, maxRuntimeMs);
 
   if (CONFIG.scanTriggerMode === 'block') {
-    publicClient.watchBlocks({
+    stopTrigger = publicClient.watchBlocks({
       onBlock: (block) => {
         if (block.number !== null) {
           scanBlock(block.number, block.timestamp);
@@ -394,10 +399,11 @@ async function main() {
       onError: (err) => console.error('[WSS Block Watcher Error]:', err.message),
     });
   } else {
-    setInterval(async () => {
+    const interval = setInterval(async () => {
       const block = await publicClient.getBlock();
       await scanBlock(block.number, block.timestamp);
     }, CONFIG.scanIntervalMs);
+    stopTrigger = () => clearInterval(interval);
   }
 }
 

@@ -5,7 +5,12 @@
   "type": "module",
   "scripts": {
     "scan": "tsx scanner.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.mjs",
+    "test:fork": "node --import tsx test/gnosis-fork.mjs",
+    "compile-contract": "node scripts/compile-contract.mjs",
+    "deploy-contract": "tsx deploy.ts",
+    "approve-contract": "tsx approve.ts"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
@@ -13,6 +18,8 @@
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "ganache": "^7.9.2",
+    "solc": "0.8.38",
     "tsx": "^4.19.0",
     "typescript": "^5.6.0"
   }
